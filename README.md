@@ -53,6 +53,7 @@ docker compose up --build
 | POST | `/jobs` | 提交生成+验证作业（后台执行），返回 `job_id` |
 | GET | `/jobs/{job_id}` | 状态、无解冲突报告、逐步日志 |
 | GET | `/jobs/{job_id}/download` | 仅在验证成功后下载 zip（含 5 个文件） |
+| GET | `/jobs/{job_id}/row-load-plan` | 仅在验证成功后给出逐行装载计划（见下文）；`?format=sql` 返回纯 SQL |
 
 ### 请求体
 
@@ -98,6 +99,32 @@ psql "$EMPTY_DATABASE_DSN" -v ON_ERROR_STOP=1 \
   -f 01_schema.sql -f 02_data.sql -f 03_constraints.sql
 ```
 
+## 逐行装载计划（row-load-plan）
+
+`GET /jobs/{job_id}/row-load-plan` 面向**目标空表已启用全部外键**的装载器：
+按作业发布时的结构和行，生成**一笔事务**内逐行 `INSERT` 的重放脚本。
+
+- 计划在作业发布时一次性算好并随包存储：之后源目录变化、并发查询都不会
+  改变该作业的计划、SQL 包或下载状态；该端点不访问源库（源库本就不读表行）；
+- 不关闭任何约束、不延后即时外键（脚本不含 `SET CONSTRAINTS`）；
+- `DEFERRABLE INITIALLY DEFERRED` 外键在 `COMMIT` 时检查——已发布的行整体
+  满足它们，因此不参与排序，仅在脚本头部列出；
+- NULL 引用遵守 `MATCH SIMPLE`（任一分量为 NULL 即豁免）/ `MATCH FULL`
+  （全 NULL 才豁免）语义，豁免行不产生排序边；自引用行（引用自身）直接写入；
+- 其余即时引用按「被引用行先插入」做确定性拓扑排序；
+- 作业未成功（非 `SUCCEEDED`）返回 409；作业不存在返回 404。
+
+**即时引用环**：若即时外键在行级构成环（例如演示库的
+`dept.mgr_emp ↔ employee.dept_id`，两者均 `NOT DEFERRABLE` 且数据非空），
+不存在合法的逐行顺序，端点返回 **422** 与结构化环报告（`kind=
+immediate_fk_cycle`，含每个环涉及的行 `table/row_index/key/values` 与外键
+`constraint/columns/references/from_row/to_row`），**不提供部分脚本**。
+此时可改用 SQL 包（先插数据后补外键）或在目标端使用初始延迟外键。
+
+`/docs` 演示：`examples/request_row_load_demo.json`（无环的
+`warehouse ← dim_item`）提交的作业返回 200 与可执行脚本；
+`examples/request_cyclic_four_tables.json` 的作业返回 422 环报告。
+
 ## 循环引用检验表示例
 
 `sql/00_demo_source_schema.sql` 构成如下循环图（全部整数列、零行）：
@@ -113,6 +140,14 @@ assignment(emp_id,project_id) → employee / project              复合主键+�
 对应请求见 `examples/request_cyclic_four_tables.json`；无解示例见
 `examples/request_unsat_conflict.json`；闭包扩展示例见
 `examples/request_closure_single.json`。
+
+另有一对**无环**表演示逐行装载计划的 200 路径：
+
+```
+warehouse.wh_id ◄── dim_item.wh_id   （NOT DEFERRABLE，DAG）
+```
+
+对应请求见 `examples/request_row_load_demo.json`。
 
 ## 本地自测（无需 Docker）
 
@@ -136,9 +171,9 @@ PYTHONPATH=. .venv/bin/python -m pytest tests/
 ## 目录结构
 
 ```
-app/            FastAPI + 内省 + z3 求解 + SQL 渲染 + 隔离库验证
+app/            FastAPI + 内省 + z3 求解 + SQL 渲染 + 隔离库验证 + 逐行装载计划
 sql/            循环引用检验表源结构、源库初始化（只读角色）
-examples/       循环四表、无解冲突、闭包扩展三类请求示例
-tests/          34 个单元/集成/端到端测试（真实 PostgreSQL）
+examples/       循环四表、无解冲突、闭包扩展、无环逐行装载四类请求示例
+tests/          54 个单元/集成/端到端测试（真实 PostgreSQL）
 docker-compose.yml / Dockerfile / requirements.txt
 ```

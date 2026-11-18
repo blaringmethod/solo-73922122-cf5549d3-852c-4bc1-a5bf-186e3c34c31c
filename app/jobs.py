@@ -22,6 +22,7 @@ from .models import (
     JobResult,
     JobStatus,
 )
+from .rowplan import ImmediateCycleError, compute_row_load_plan
 from .selector import validate_request
 from .solver import Generator, SolverTimeout, Unsatisfiable
 from .sqlgen import build_package
@@ -32,6 +33,7 @@ class JobStore:
     def __init__(self) -> None:
         self._jobs: dict[str, JobResult] = {}
         self._packages: dict[str, dict[str, str]] = {}
+        self._row_plans: dict[str, dict] = {}
         self._lock = threading.Lock()
 
     def create(self) -> str:
@@ -50,6 +52,9 @@ class JobStore:
     def package(self, job_id: str) -> dict[str, str] | None:
         return self._packages.get(job_id)
 
+    def row_plan(self, job_id: str) -> dict | None:
+        return self._row_plans.get(job_id)
+
     def update(self, job_id: str, **kw) -> None:
         with self._lock:
             job = self._jobs[job_id]
@@ -62,9 +67,10 @@ class JobStore:
             job = self._jobs[job_id]
             job.log.append(f"{datetime.now(timezone.utc).time().isoformat()} {line}")
 
-    def publish(self, job_id: str, package: dict[str, str]) -> None:
+    def publish(self, job_id: str, package: dict[str, str], row_plan: dict) -> None:
         with self._lock:
             self._packages[job_id] = package
+            self._row_plans[job_id] = row_plan
 
     def purge_expired(self) -> None:
         now = time.time()
@@ -78,6 +84,7 @@ class JobStore:
             for jid in stale:
                 self._jobs.pop(jid, None)
                 self._packages.pop(jid, None)
+                self._row_plans.pop(jid, None)
 
 
 STORE = JobStore()
@@ -274,8 +281,43 @@ def run_job(job_id: str, req: GenerateRequest) -> None:
             )
             return
 
+        # The row-load plan is computed once, here, from the exact structures
+        # and rows being published. Later source-catalog changes and
+        # concurrent queries can never alter the stored plan; the source
+        # database is not touched for it (it never reads rows anyway).
+        try:
+            plan_body = compute_row_load_plan(
+                job_id,
+                req.schema_name,
+                {t: schemas[t] for t in selected},
+                selected,
+                data,
+            )
+            row_plan = {"state": "ready", "body": plan_body}
+            store.append_log(
+                job_id,
+                f"row-load plan ready: {plan_body['insert_count']} INSERTs "
+                f"in one transaction",
+            )
+        except ImmediateCycleError as cyc:
+            row_plan = {"state": "cycle", "detail": cyc.detail}
+            store.append_log(
+                job_id,
+                f"row-load plan: {cyc}; cycle report stored, no partial script",
+            )
+        except Exception as exc:  # the plan must never sink a verified job
+            row_plan = {
+                "state": "error",
+                "message": f"{exc.__class__.__name__}: {exc}",
+            }
+            store.append_log(
+                job_id,
+                f"row-load plan computation failed: "
+                f"{exc.__class__.__name__}: {exc}",
+            )
+
         # Only now is the package stored and downloadable.
-        store.publish(job_id, package)
+        store.publish(job_id, package, row_plan)
         store.append_log(job_id, "package verified and published")
         store.update(job_id, status=JobStatus.SUCCEEDED)
     except Exception as exc:  # defensive: never leave a job dangling

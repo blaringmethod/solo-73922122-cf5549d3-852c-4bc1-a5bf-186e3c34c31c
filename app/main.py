@@ -9,6 +9,9 @@ GET  /schemas/{schema}/tables/{table}/structure
 POST /jobs                    create a generation/verification job
 GET  /jobs/{job_id}           status, conflict report, logs
 GET  /jobs/{job_id}/download  zip package, available only after SUCCEEDED
+GET  /jobs/{job_id}/row-load-plan
+                              single-transaction row-by-row INSERT replay of
+                              the published sample for FK-enabled targets
 GET  /docs                    OpenAPI Swagger UI
 """
 from __future__ import annotations
@@ -136,3 +139,51 @@ def download_job(job_id: str):
             "X-Contains-Real-Patient-Data": "false",
         },
     )
+
+
+@app.get(
+    "/jobs/{job_id}/row-load-plan",
+    tags=["jobs"],
+    responses={
+        200: {"description": "可执行的逐行装载计划（JSON；加 ?format=sql 返回纯 SQL 脚本）"},
+        404: {"description": "job 不存在或已过期"},
+        409: {"description": "作业尚未验证成功，拒绝提供计划"},
+        422: {"description": "即时外键引用环：返回涉及行与外键，不提供部分脚本"},
+    },
+)
+def row_load_plan(job_id: str, format: str | None = None):
+    """Row-by-row replay of the published sample into an FK-enabled target.
+
+    The plan is computed once at publish time from the verified structures
+    and rows; this endpoint only serves the stored artefact, so source
+    catalog changes and concurrent queries cannot alter it. Immediate
+    foreign keys are topologically ordered (never deferred, constraints stay
+    enabled); DEFERRABLE INITIALLY DEFERRED keys hold at COMMIT. If the
+    immediate references form a cycle, the involved rows and foreign keys
+    are returned (422) and no partial script is produced.
+    """
+    job = STORE.get(job_id)
+    if job is None:
+        raise HTTPException(404, "job 不存在或已过期")
+    if job.status != JobStatus.SUCCEEDED:
+        raise HTTPException(
+            409,
+            f"作业尚未验证成功（当前状态 {job.status.value}）；"
+            f"未成功作业不提供行装载计划",
+        )
+    outcome = STORE.row_plan(job_id)
+    if outcome is None:
+        raise HTTPException(409, "行装载计划不可用")
+    state = outcome.get("state")
+    if state == "cycle":
+        return JSONResponse(status_code=422, content=outcome["detail"])
+    if state != "ready":
+        raise HTTPException(
+            500, f"行装载计划生成失败: {outcome.get('message', '未知错误')}"
+        )
+    body = outcome["body"]
+    if format == "sql":
+        return Response(
+            content=body["sql"], media_type="text/plain; charset=utf-8"
+        )
+    return body

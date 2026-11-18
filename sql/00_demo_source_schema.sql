@@ -71,3 +71,25 @@ ALTER TABLE dept
     ADD CONSTRAINT dept_mgr_fk FOREIGN KEY (mgr_emp)
         REFERENCES employee (emp_id) MATCH SIMPLE
         ON DELETE SET NULL ON UPDATE CASCADE NOT DEFERRABLE;
+
+-- ============================================================
+-- Acyclic pair for the row-load-plan demo: every immediate FK
+-- chain here is a DAG, so GET /jobs/{job_id}/row-load-plan
+-- returns an executable single-transaction script (HTTP 200).
+-- (The cyclic four tables above exercise the 422 cycle report.)
+-- ============================================================
+CREATE TABLE warehouse (
+    wh_id    integer NOT NULL,
+    wh_code  smallint NOT NULL,
+    CONSTRAINT warehouse_pk PRIMARY KEY (wh_id)
+);
+
+CREATE TABLE dim_item (
+    item_id  integer NOT NULL,
+    wh_id    integer NOT NULL,
+    sku      integer,
+    CONSTRAINT dim_item_pk PRIMARY KEY (item_id),
+    CONSTRAINT dim_item_wh_fk FOREIGN KEY (wh_id)
+        REFERENCES warehouse (wh_id) MATCH SIMPLE
+        ON DELETE RESTRICT ON UPDATE NO ACTION NOT DEFERRABLE
+);

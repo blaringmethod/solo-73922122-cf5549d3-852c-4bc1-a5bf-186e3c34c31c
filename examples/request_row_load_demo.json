@@ -1,0 +1,23 @@
+{
+  "_comment": "无环演示：dim_item 经即时外键引用 warehouse，闭包仅 2 张表；该作业的逐行装载计划可拓扑排序，GET /jobs/{job_id}/row-load-plan 返回 200 与单事务脚本（循环四表作业则返回 422 环报告）。",
+  "schema_name": "public",
+  "tables": [
+    {
+      "table": "warehouse",
+      "rows": 3,
+      "ranges": {
+        "wh_id":   {"low": 1, "high": 3},
+        "wh_code": {"low": 10, "high": 99}
+      }
+    },
+    {
+      "table": "dim_item",
+      "rows": 6,
+      "ranges": {
+        "item_id": {"low": 1, "high": 100},
+        "wh_id":   {"low": 1, "high": 3},
+        "sku":     {"low": 1000, "high": 9999}
+      }
+    }
+  ]
+}
